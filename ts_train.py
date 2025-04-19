@@ -4,6 +4,7 @@ refer:
 - https://github.com/pioneer-innovation/Real-3D-Embodied-Dataset
 
 """
+import math
 import sys
 import os
 curr_path = os.path.dirname(os.path.abspath(__file__))
@@ -28,6 +29,10 @@ from tianshou.utils import TensorboardLogger, LazyLogger
 from tianshou.data import VectorReplayBuffer
 from tianshou.utils.net.common import ActorCritic, DataParallelNet
 from tianshou.trainer import OnpolicyTrainer
+
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.tensorboard import SummaryWriter
 
 print(ts.__version__)
 import model
@@ -112,11 +117,17 @@ def train(args):
         args.opt.optimizer + "_" \
         + date
 
-    if args.cuda and torch.cuda.is_available():
-        device = torch.device("cuda", args.device)
+    ngpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if ngpus > 1:
+    # 初始化 DDP
+        dist.init_process_group(backend='nccl', init_method='env://')
+        local_rank = int(os.environ['LOCAL_RANK'])
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
     else:
-        device = torch.device("cpu")
-
+        #单卡模式
+        local_rank = 0
+        device = torch.device("cuda" if args.cuda and torch.cuda.is_available() else "cpu")
     set_seed(args.seed, args.cuda, args.cuda_deterministic)
 
     # environments 
@@ -124,6 +135,8 @@ def train(args):
     # 如果开启了 cuda，就检测 GPU 数；否则当作 1 卡
     n_gpu = torch.cuda.device_count() if args.cuda and torch.cuda.is_available() else 1
     if n_gpu > 1:
+        # 1) 计算原始总交互步数
+        total_steps = args.train.step_per_epoch * args.train.epoch
         print(f"Detected {n_gpu} GPUs, scaling batch_size, lr and num_processes accordingly")
         # 放大全局 batch_size
         args.train.batch_size *= n_gpu
@@ -131,24 +144,37 @@ def train(args):
         args.opt.lr *= n_gpu
         # 放大采样子进程数
         args.train.num_processes *= n_gpu
+         # 3) 同时扩展每 epoch 的步数，并重新计算 epoch
+        args.train.step_per_epoch *= n_gpu
+        args.train.epoch = math.ceil(total_steps / args.train.step_per_epoch)
+
+        print(f"=> keep total env steps={total_steps}: now step_per_epoch={args.train.step_per_epoch}, epoch={args.train.epoch}")
+
+    
+    if ngpus > 1:
+        args.train.batch_size = args.train.batch_size * ngpus
+        print(f"Adjusted batch_size to {args.train.batch_size} for {ngpus} GPUs")
+    else:
+        print(f"Using batch_size: {args.train.batch_size} for single GPU")
 
     # environments
     train_envs, test_envs = make_envs(args)  # make envs and set random seed
 
     # network
     actor, critic = build_net(args, device)
-    actor_critic = ActorCritic(actor, critic)
-    # 单机多卡：如果发现不止一张 GPU，就并行化 actor & critic
-    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-        actor   = DataParallelNet(actor)
-        critic  = DataParallelNet(critic)
-        print("Using DataParallel on GPUs:", list(range(torch.cuda.device_count())))
-
-    # 最终把它们都推到 device（DataParallelNet 内部会 scatter）
-    actor   = actor.to(device)
-    critic  = critic.to(device)
-
-    # 用并行化后的 actor/critic 创建 ActorCritic 打包网络、优化器
+    if ngpus > 1:
+    # 改为 DDP 包装（替换掉 DataParallelNet） :contentReference[oaicite:0]{index=0}&#8203;:contentReference[oaicite:1]{index=1}
+        actor = DistributedDataParallel(actor.to(device),
+                                        device_ids=[local_rank],
+                                        output_device=local_rank,
+                                        find_unused_parameters=True)
+        critic = DistributedDataParallel(critic.to(device),
+                                        device_ids=[local_rank],
+                                        output_device=local_rank,
+                                        find_unused_parameters=True)
+    else:
+        actor = actor.to(device)
+        critic = critic.to(device)
     actor_critic = ActorCritic(actor, critic)
 
     if args.opt.optimizer == 'Adam':
@@ -208,16 +234,17 @@ def train(args):
     
     is_debug = True if sys.gettrace() else False
     if not is_debug:
-        writer = SummaryWriter(log_path)
-        logger = TensorboardLogger(
-            writer=writer,
-            train_interval=args.log_interval,
-            update_interval=args.log_interval
-        )
-        # backup the config file, os.path.join(,)
-        shutil.copy(args.config, log_path)  # config file
-        shutil.copy("model.py", log_path)  # network
-        shutil.copy("arguments.py", log_path)  # network
+        # 仅主进程写日志
+        rank = dist.get_rank()  if ngpus > 1 else 0
+        if rank == 0:
+            writer = SummaryWriter(log_path)
+            logger = TensorboardLogger(writer,
+                                    train_interval=args.log_interval,
+                                    update_interval=args.log_interval)
+            # backup the config file, os.path.join(,)
+            shutil.copy(args.config, log_path)  # config file
+            shutil.copy("model.py", log_path)  # network
+            shutil.copy("arguments.py", log_path)  # network
     else:
         logger = LazyLogger()
 
@@ -226,6 +253,20 @@ def train(args):
         # monitor leraning rate in tensorboard
         # writer.add_scalar('train/lr', optim.param_groups[0]["lr"], env_step)
         pass
+
+    def test_fn(epoch, env_step):
+        policy.eval()
+        test_collector.reset()
+        # 重新收集若干测试 episode
+        stats = test_collector.collect(n_episode=10)
+        # 支持 dict 或 CollectStats 对象两种情况
+        if isinstance(stats, dict):
+            ratio = stats.get("ratio", None)
+            std   = stats.get("ratio_std", 0.0)
+        else:
+            ratio = getattr(stats, "ratio", None)
+            std   = getattr(stats, "ratio_std", 0.0)
+        print(f"[Epoch {epoch}] box utilization ratio={ratio:.4f} (std={std:.4f})")
 
     def save_best_fn(policy):
         if not is_debug:
@@ -279,7 +320,8 @@ def train(args):
         save_best_fn=save_best_fn,
         save_checkpoint_fn=save_checkpoint_fn,
         logger=logger,
-        test_in_train=False,
+        test_in_train=True,      # 确保 test_fn 被调用
+        test_fn=test_fn,        # 每个 epoch 后打印 box_ratio :contentReference[oaicite:1]{index=1}
     )
     # run 并获取结果；v1.2 中返回的是 dataclass 而非 dict
     result = trainer.run()
