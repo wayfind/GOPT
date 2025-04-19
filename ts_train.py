@@ -120,6 +120,19 @@ def train(args):
     set_seed(args.seed, args.cuda, args.cuda_deterministic)
 
     # environments 
+    # —— 自动根据可见 GPU 数量缩放超参数（无需改 config.yaml） —— #
+    # 如果开启了 cuda，就检测 GPU 数；否则当作 1 卡
+    n_gpu = torch.cuda.device_count() if args.cuda and torch.cuda.is_available() else 1
+    if n_gpu > 1:
+        print(f"Detected {n_gpu} GPUs, scaling batch_size, lr and num_processes accordingly")
+        # 放大全局 batch_size
+        args.train.batch_size *= n_gpu
+        # 放大学习率
+        args.opt.lr *= n_gpu
+        # 放大采样子进程数
+        args.train.num_processes *= n_gpu
+
+    # environments
     train_envs, test_envs = make_envs(args)  # make envs and set random seed
 
     # network
