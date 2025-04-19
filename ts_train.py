@@ -30,7 +30,7 @@ from tianshou.data import VectorReplayBuffer
 from tianshou.utils.net.common import ActorCritic
 from tianshou.trainer import OnpolicyTrainer
 
-import torch.distributed as dist
+import torch.distributed as dist_module
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.tensorboard import SummaryWriter
 
@@ -120,7 +120,7 @@ def train(args):
     ngpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
     if ngpus > 1:
     # 初始化 DDP
-        dist.init_process_group(backend='nccl', init_method='env://')
+        dist_module.init_process_group(backend='nccl', init_method='env://')
         local_rank = int(os.environ['LOCAL_RANK'])
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
@@ -227,7 +227,7 @@ def train(args):
     is_debug = True if sys.gettrace() else False
     if not is_debug:
         # 仅主进程写日志
-        rank = dist.get_rank()  if ngpus > 1 else 0
+        rank = dist_module.get_rank()  if ngpus > 1 else 0
         if rank == 0:
             writer = SummaryWriter(log_path)
             logger = TensorboardLogger(writer,
