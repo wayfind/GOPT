@@ -125,7 +125,18 @@ def train(args):
     # network
     actor, critic = build_net(args, device)
     actor_critic = ActorCritic(actor, critic)
+    # 单机多卡：如果发现不止一张 GPU，就并行化 actor & critic
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        actor   = DataParallelNet(actor)
+        critic  = DataParallelNet(critic)
 
+    # 最终把它们都推到 device（DataParallelNet 内部会 scatter）
+    actor   = actor.to(device)
+    critic  = critic.to(device)
+
+    # 用并行化后的 actor/critic 创建 ActorCritic 打包网络、优化器
+    actor_critic = ActorCritic(actor, critic)
+    
     if args.opt.optimizer == 'Adam':
         optim = torch.optim.Adam(actor_critic.parameters(), lr=args.opt.lr, eps=args.opt.eps)
     elif args.opt.optimizer == 'RMSprop':
