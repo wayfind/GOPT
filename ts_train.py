@@ -27,7 +27,7 @@ from torch.optim.lr_scheduler import LambdaLR, ExponentialLR
 import tianshou as ts
 from tianshou.utils import TensorboardLogger, LazyLogger
 from tianshou.data import VectorReplayBuffer
-from tianshou.utils.net.common import ActorCritic, DataParallelNet
+from tianshou.utils.net.common import ActorCritic
 from tianshou.trainer import OnpolicyTrainer
 
 import torch.distributed as dist
@@ -133,29 +133,21 @@ def train(args):
     # environments 
     # —— 自动根据可见 GPU 数量缩放超参数（无需改 config.yaml） —— #
     # 如果开启了 cuda，就检测 GPU 数；否则当作 1 卡
-    n_gpu = torch.cuda.device_count() if args.cuda and torch.cuda.is_available() else 1
-    if n_gpu > 1:
+    if ngpus > 1:
         # 1) 计算原始总交互步数
         total_steps = args.train.step_per_epoch * args.train.epoch
-        print(f"Detected {n_gpu} GPUs, scaling batch_size, lr and num_processes accordingly")
+        print(f"Detected {ngpus} GPUs, scaling batch_size, lr and num_processes accordingly")
         # 放大全局 batch_size
-        args.train.batch_size *= n_gpu
+        args.train.batch_size *= ngpus
         # 放大学习率
-        args.opt.lr *= n_gpu
+        args.opt.lr *= ngpus
         # 放大采样子进程数
-        args.train.num_processes *= n_gpu
+        args.train.num_processes *= ngpus
          # 3) 同时扩展每 epoch 的步数，并重新计算 epoch
-        args.train.step_per_epoch *= n_gpu
+        args.train.step_per_epoch *= ngpus
         args.train.epoch = math.ceil(total_steps / args.train.step_per_epoch)
 
         print(f"=> keep total env steps={total_steps}: now step_per_epoch={args.train.step_per_epoch}, epoch={args.train.epoch}")
-
-    
-    if ngpus > 1:
-        args.train.batch_size = args.train.batch_size * ngpus
-        print(f"Adjusted batch_size to {args.train.batch_size} for {ngpus} GPUs")
-    else:
-        print(f"Using batch_size: {args.train.batch_size} for single GPU")
 
     # environments
     train_envs, test_envs = make_envs(args)  # make envs and set random seed
@@ -241,10 +233,12 @@ def train(args):
             logger = TensorboardLogger(writer,
                                     train_interval=args.log_interval,
                                     update_interval=args.log_interval)
-            # backup the config file, os.path.join(,)
-            shutil.copy(args.config, log_path)  # config file
-            shutil.copy("model.py", log_path)  # network
-            shutil.copy("arguments.py", log_path)  # network
+        else:
+            logger = LazyLogger()
+        # backup the config file, os.path.join(,)
+        shutil.copy(args.config, log_path)  # config file
+        shutil.copy("model.py", log_path)  # network
+        shutil.copy("arguments.py", log_path)  # network
     else:
         logger = LazyLogger()
 
