@@ -27,7 +27,7 @@ This code has been tested on Ubuntu 20.04 with Cuda 12.1, Python3.9 and Pytorch 
 git clone https://github.com/Xiong5Heng/GOPT.git
 cd GOPT
 
-conda create -n GOPT python=3.9
+conda create -n GOPT python=3.11
 conda activate GOPT
 
 # install pytorch
@@ -36,8 +36,8 @@ conda install pytorch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 pytorch-cuda=
 # install other dependencies
 pip install -r requirements.txt
 
-# install tianshou1.2
-$ pip install git+https://github.com/thu-ml/tianshou.git@master --upgrade
+# install tianshou1.1
+$ pip install git+https://github.com/thu-ml/tianshou/tree/v1.1.0 --upgrade
 ```
 
 
