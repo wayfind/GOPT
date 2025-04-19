@@ -35,7 +35,13 @@ conda install pytorch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 pytorch-cuda=
 
 # install other dependencies
 pip install -r requirements.txt
+
+# install tianshou1.2
+$ pip install git+https://github.com/thu-ml/tianshou.git@master --upgrade
 ```
+
+
+
 
 ## Training
 The dataset is generated on the fly, so you can directly train the model by running the following command.

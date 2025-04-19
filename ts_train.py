@@ -27,8 +27,9 @@ import tianshou as ts
 from tianshou.utils import TensorboardLogger, LazyLogger
 from tianshou.data import VectorReplayBuffer
 from tianshou.utils.net.common import ActorCritic, DataParallelNet
-from tianshou.trainer import onpolicy_trainer
+from tianshou.trainer import OnpolicyTrainer
 
+print(ts.__version__)
 import model
 import arguments
 from tools import *
@@ -152,11 +153,14 @@ def train(args):
             critic=critic,
             optim=optim,
             dist_fn=dist,
-            discount_factor=args.train.gamma,
+            batch_size=args.train.batch_size,
+            action_space=train_envs.action_space[0],
+            action_scaling=False,            
             eps_clip=args.train.clip_param,
             advantage_normalization=False,
             vf_coef=args.loss.value,
             ent_coef=args.loss.entropy,
+            discount_factor=args.train.gamma,
             gae_lambda=args.train.gae_lambda,
             lr_scheduler=lr_scheduler
         )
@@ -236,24 +240,27 @@ def train(args):
     train_collector = PackCollector(policy, train_envs, buffer)
     test_collector = PackCollector(policy, test_envs)
     
-    # trainer
-    result = onpolicy_trainer(
-        policy,
-        train_collector,
-        test_collector,
+    trainer = OnpolicyTrainer(
+        policy=policy,
+        train_collector=train_collector,
+        test_collector=test_collector,
         max_epoch=args.train.epoch,
         step_per_epoch=args.train.step_per_epoch,
         repeat_per_collect=args.train.repeat_per_collect,
-        episode_per_test=10, # args.test_num,
+        episode_per_test=10,
         batch_size=args.train.batch_size,
         step_per_collect=args.train.step_per_collect,
-        # episode_per_collect=args.episode_per_collect,
         train_fn=train_fn,
         save_best_fn=save_best_fn,
         save_checkpoint_fn=save_checkpoint_fn,
         logger=logger,
-        test_in_train=False
+        test_in_train=False,
     )
+    # run 并获取结果；v1.2 中返回的是 dataclass 而非 dict
+    result = trainer.run()
+    # 如果后续逻辑仍认为是 dict，可转回
+    if not isinstance(result, dict):
+        result = vars(result)
 
     final_save_fn(policy)
     pprint.pprint(f'Finished training! \n{result}')

@@ -195,7 +195,7 @@ class PackingEnv(gym.Env):
 
         return self.cur_observation, reward, done, False, info
 
-    def reset(self, seed: Optional[int] = None):
+    def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
         self.box_creator.reset()
         self.container = Container(*self.bin_size)
