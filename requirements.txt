@@ -8,3 +8,4 @@ numba>=0.51.0
 h5py>=2.10.0
 tqdm
 omegaconf
+torch-tb-profiler

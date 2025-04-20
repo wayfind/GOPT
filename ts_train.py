@@ -4,12 +4,15 @@ refer:
 - https://github.com/pioneer-innovation/Real-3D-Embodied-Dataset
 
 """
+from datetime import datetime
 import math
 import sys
 import os
 curr_path = os.path.dirname(os.path.abspath(__file__))
 parent_path = os.path.dirname(curr_path)  
 sys.path.append(parent_path) 
+os.environ['OMP_NUM_THREADS'] = '2'          # 控制 OpenMP
+os.environ['MKL_NUM_THREADS']  = '2'          # 控制 MKL
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -32,7 +35,6 @@ from tianshou.trainer import OnpolicyTrainer
 
 import torch.distributed as dist_module
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.tensorboard import SummaryWriter
 
 print(ts.__version__)
 import model
@@ -42,6 +44,54 @@ from masked_ppo import MaskedPPOPolicy
 from masked_a2c import MaskedA2CPolicy
 from mycollector import PackCollector
  
+
+def setup_logging(args, ngpus):
+    # 检测是否在调试器下
+    is_debug = True if sys.gettrace() else False
+    # 计算当前进程 rank（单卡默认为 0）
+    rank = dist_module.get_rank() if ngpus > 1 else 0
+
+    # 默认都给这两个，防止未定义错误
+    writer = None
+    logger = LazyLogger()
+    log_path = None
+
+    # 只有主进程且非调试模式时真正初始化 TensorBoard
+    if not is_debug and rank == 0:
+        # 1) 生成一个带微秒的唯一目录名
+        ts = datetime.now().strftime('%Y.%m.%d-%H-%M-%S-%f')
+        name = (
+            f"{args.env.id}_"
+            f"{args.env.container_size[0]}-{args.env.container_size[1]}-{args.env.container_size[2]}_"
+            f"{args.env.scheme}_{args.env.k_placement}_"
+            f"{args.env.box_type}_{args.train.algo}_"
+            f"seed{args.seed}_{args.opt.optimizer}_"
+            f"{ts}"
+        )
+        log_base = "logs"
+        log_path = os.path.join(log_base, name)
+
+        # 2) 确保父目录存在，然后创建自身目录
+        os.makedirs(log_base, exist_ok=True)
+        os.makedirs(log_path, exist_ok=True)
+
+        # 3) 初始化 SummaryWriter & TensorboardLogger
+        writer = SummaryWriter(log_path)
+        logger = TensorboardLogger(
+            writer,
+            train_interval=args.log_interval,
+            update_interval=args.log_interval,
+        )
+
+        # 4) 备份配置和关键脚本
+        for fname in (args.config, "model.py", "arguments.py"):
+            try:
+                shutil.copy(fname, log_path)
+            except FileNotFoundError:
+                # 若某个文件不存在，可根据需要忽略或报 warn
+                print(f"[rank {rank}] Warning: cannot backup {fname}")
+
+    return writer, logger, log_path
 
 def make_envs(args):
 
@@ -107,7 +157,7 @@ def build_net(args, device):
 
 def train(args):
 
-    date = time.strftime(r'%Y.%m.%d-%H-%M-%S', time.localtime(time.time()))
+    date = datetime.now().strftime('%Y.%m.%d-%H-%M-%S-%f')
     time_str = args.env.id + "_" + \
         str(args.env.container_size[0]) + "-" + str(args.env.container_size[1]) + "-" + str(args.env.container_size[2]) + "_" + \
         args.env.scheme + "_" + str(args.env.k_placement) + "_" +\
@@ -144,8 +194,7 @@ def train(args):
         # 放大采样子进程数
         args.train.num_processes *= ngpus
          # 3) 同时扩展每 epoch 的步数，并重新计算 epoch
-        args.train.step_per_epoch *= ngpus
-        args.train.epoch = math.ceil(total_steps / args.train.step_per_epoch)
+        args.train.epoch = math.ceil(total_steps / (args.train.step_per_epoch * ngpus) )
 
         print(f"=> keep total env steps={total_steps}: now step_per_epoch={args.train.step_per_epoch}, epoch={args.train.epoch}")
 
@@ -159,15 +208,17 @@ def train(args):
         actor = DistributedDataParallel(actor.to(device),
                                         device_ids=[local_rank],
                                         output_device=local_rank,
-                                        find_unused_parameters=True)
+                                        find_unused_parameters=False)
         critic = DistributedDataParallel(critic.to(device),
                                         device_ids=[local_rank],
                                         output_device=local_rank,
-                                        find_unused_parameters=True)
+                                        find_unused_parameters=False)
     else:
         actor = actor.to(device)
         critic = critic.to(device)
     actor_critic = ActorCritic(actor, critic)
+
+    writer, logger, log_path = setup_logging(args, ngpus)
 
     if args.opt.optimizer == 'Adam':
         optim = torch.optim.Adam(actor_critic.parameters(), lr=args.opt.lr, eps=args.opt.eps)
@@ -229,16 +280,21 @@ def train(args):
         # 仅主进程写日志
         rank = dist_module.get_rank()  if ngpus > 1 else 0
         if rank == 0:
-            writer = SummaryWriter(log_path)
+            if not os.path.isdir(log_path):
+                writer = SummaryWriter(log_path)
+            else:
+                    # 已有日志目录，直接复用
+                writer = SummaryWriter(log_path)
             logger = TensorboardLogger(writer,
                                     train_interval=args.log_interval,
                                     update_interval=args.log_interval)
+            shutil.copy(args.config, log_path)  # config file
+            shutil.copy("model.py", log_path)  # network
+            shutil.copy("arguments.py", log_path)  # network
         else:
+            writer = None
             logger = LazyLogger()
         # backup the config file, os.path.join(,)
-        shutil.copy(args.config, log_path)  # config file
-        shutil.copy("model.py", log_path)  # network
-        shutil.copy("arguments.py", log_path)  # network
     else:
         logger = LazyLogger()
 
@@ -263,36 +319,47 @@ def train(args):
         print(f"[Epoch {epoch}] box utilization ratio={ratio:.4f} (std={std:.4f})")
 
     def save_best_fn(policy):
-        if not is_debug:
-            torch.save(policy.state_dict(), os.path.join(log_path, 'policy_step_best.pth'))
-        else:
-            pass
+        rank = dist_module.get_rank() if ngpus > 1 else 0
+        if not is_debug and rank == 0:
+            torch.save(policy.state_dict(),
+                       os.path.join(log_path, 'policy_step_best.pth'))
 
     def final_save_fn(policy):
-        torch.save(policy.state_dict(), os.path.join(log_path, 'policy_step_final.pth'))
-
+        # 仅 rank 0 写最终模型
+        rank = dist_module.get_rank() if ngpus > 1 else 0
+        if rank == 0:
+            torch.save(policy.state_dict(),
+                       os.path.join(log_path, 'policy_step_final.pth'))
+            
     def save_checkpoint_fn(epoch, env_step, gradient_step):
-        if not is_debug:
-            # see also: https://pytorch.org/tutorials/beginner/saving_loading_models.html
+        # 仅 rank 0 保存 checkpoint
+        rank = dist_module.get_rank() if ngpus > 1 else 0
+        if not is_debug and rank == 0:
             ckpt_path = os.path.join(log_path, "checkpoint.pth")
-            # Example: saving by epoch num
-            # ckpt_path = os.path.join(log_path, f"checkpoint_{epoch}.pth")
-            torch.save({"model": policy.state_dict(), "optim": optim.state_dict()}, ckpt_path)
+            torch.save({
+                "model": policy.state_dict(),
+                "optim": optim.state_dict()
+            }, ckpt_path)
             return ckpt_path
-        else:
-            return None
+        return None
     
     def watch(train_info):
+        rank = dist_module.get_rank() if ngpus > 1 else 0
+        if rank != 0:
+            return
         print("Setup test envs ...")
         policy.eval()
         test_envs.seed(args.seed)
         print("Testing agent ...")
         test_collector.reset()
-        result = test_collector.collect(n_episode=1000)
-        ratio = result["ratio"]
-        ratio_std = result["ratio_std"]
-        total = result["num"]
-        print(f"The result (over {result['n/ep']} episodes): ratio={ratio}, ratio_std={ratio_std}, total={total}")
+        result = test_collector.collect(n_episode=10)
+        # 仅支持新版 CollectStats 对象
+        ratio     = result.ratio
+        ratio_std = result.ratio_std
+        total     = result.num
+        #test_episode      = result.test_episode
+        print(f"The result (over episodes): ratio={ratio}, ratio_std={ratio_std}, total={total}")
+       
         with open(os.path.join(log_path, f"{ratio:.4f}_{ratio_std:.4f}_{total}.txt"), "w") as file:
             file.write(str(train_info).replace("{", "").replace("}", "").replace(", ", "\n"))
 
@@ -335,3 +402,6 @@ if __name__ == '__main__':
     args.train.step_per_collect = args.train.num_processes * args.train.num_steps  
 
     train(args)
+    # 销毁 DDP 进程组
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        dist_module.destroy_process_group()

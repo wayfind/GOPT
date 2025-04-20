@@ -1,3 +1,4 @@
+from datetime import datetime
 import sys
 import os
 
@@ -31,6 +32,53 @@ from masked_ppo import MaskedPPOPolicy
 from masked_a2c import MaskedA2CPolicy
 from mycollector import PackCollector
 
+def setup_logging(args, ngpus):
+    # 检测是否在调试器下
+    is_debug = True if sys.gettrace() else False
+    # 计算当前进程 rank（单卡默认为 0）
+    rank = dist_module.get_rank() if ngpus > 1 else 0
+
+    # 默认都给这两个，防止未定义错误
+    writer = None
+    logger = LazyLogger()
+    log_path = None
+
+    # 只有主进程且非调试模式时真正初始化 TensorBoard
+    if not is_debug and rank == 0:
+        # 1) 生成一个带微秒的唯一目录名
+        ts = datetime.now().strftime('%Y.%m.%d-%H-%M-%S-%f')
+        name = (
+            f"{args.env.id}_"
+            f"{args.env.container_size[0]}-{args.env.container_size[1]}-{args.env.container_size[2]}_"
+            f"{args.env.scheme}_{args.env.k_placement}_"
+            f"{args.env.box_type}_{args.train.algo}_"
+            f"seed{args.seed}_{args.opt.optimizer}_"
+            f"{ts}"
+        )
+        log_base = "logs"
+        log_path = os.path.join(log_base, name)
+
+        # 2) 确保父目录存在，然后创建自身目录
+        os.makedirs(log_base, exist_ok=True)
+        os.makedirs(log_path, exist_ok=True)
+
+        # 3) 初始化 SummaryWriter & TensorboardLogger
+        writer = SummaryWriter(log_path)
+        logger = TensorboardLogger(
+            writer,
+            train_interval=args.log_interval,
+            update_interval=args.log_interval,
+        )
+
+        # 4) 备份配置和关键脚本
+        for fname in (args.config, "model.py", "arguments.py"):
+            try:
+                shutil.copy(fname, log_path)
+            except FileNotFoundError:
+                # 若某个文件不存在，可根据需要忽略或报 warn
+                print(f"[rank {rank}] Warning: cannot backup {fname}")
+
+    return writer, logger, log_path
 
 def make_envs(args):
     """创建训练和测试环境。"""
